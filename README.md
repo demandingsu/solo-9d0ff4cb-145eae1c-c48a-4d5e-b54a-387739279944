@@ -1,13 +1,18 @@
-# 公交刷卡流水归站 API
+# 公交刷卡流水归站与终端校时 API
 
-把刷卡流水里的**临时站号**归属到**真实站点**，供月度客流分析。
+把刷卡流水里的**临时站号**归属到**真实站点**，供月度客流分析；并支持按终端
+**校正设备时钟偏差**（时钟偏快导致流水落入错误的 UTC 月份或站点时段）。
 
 - FastAPI + SQLite（WAL），单容器即可运行；
+- 刷卡 CSV 新增**可选 `terminal_id`** 列；按终端设置**有符号秒偏移**，
+  校正时刻 = 原始时刻 + 偏移（偏快传负、偏慢传正）；
+- **原始 UTC 时间原样保留**，归站与月度客流一律按**校正时刻**计算；
+- 偏移更正会在同一事务内**重算该终端全部历史流水**，跨映射时段、跨 UTC
+  月份的归属与统计同步更新；未标终端的旧数据保持原样；
+- 同号重传按**原始内容（含 terminal_id）**判重，偏移变化不会误报冲突；
+- 校时、归站重算、月度统计在**同一事务提交**，失败回滚不留部分更改；
 - 同一临时站号可被不同线路复用，映射按 **(线路, 临时站号)** 整组替换；
-- 改站记录晚到也没关系：每次导入后旧流水会在同一事务里**重新归属**；
-- 流水按流水号幂等：同号同内容重传不重复计数，同号不同内容整批拒收；
-- 映射、流水、月度统计在同一事务提交，查询永远只见一致的已提交状态；
-- 导入失败（校验错误 / 业务冲突）不改变已有结果。
+- 映射、流水、月度统计在同一事务提交，查询永远只见一致的已提交状态。
 
 ## 快速开始
 
@@ -23,9 +28,13 @@ docker compose up --build
 **刷卡流水**（`POST /api/imports/swipes`）
 
 ```csv
-txn_id,swipe_time_utc,line,temp_station_id
-S001,2026-01-05T08:15:00Z,L1,T100
+txn_id,swipe_time_utc,line,temp_station_id,terminal_id
+S001,2026-01-05T08:15:00Z,L1,T100,TM-A
 ```
+
+- `terminal_id` 为**可选列**：表头不含该列（旧格式文件）或单元格留空，
+  都视为「未标终端」，其校正时刻恒等于原始时刻、不参与任何校时；
+- 同一终端的流水使用相同 `terminal_id`，校时按该终端当前偏移计算校正时刻。
 
 **站号映射**（`POST /api/imports/mappings`）
 
@@ -38,62 +47,100 @@ L1,T100,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Central Station
 - 映射生效时段为**左闭右开** `[valid_from_utc, valid_to_utc)`；
 - 文件需 UTF-8 编码（容忍 BOM），表头列名必须与上表一致。
 
+## 终端校时
+
+```bash
+# 设备 TM-A 时钟偏快 30 分钟 -> 负偏移把时刻拨慢 1800 秒
+curl -X PUT http://localhost:8000/api/terminals/TM-A/offset \
+  -H 'Content-Type: application/json' \
+  -d '{"offset_seconds": -1800, "note": "现场核对发现偏快30分钟"}'
+```
+
+- 校正时刻 = 原始 UTC 时刻 + `offset_seconds`（有符号整数秒，范围 ±366 天）；
+- 提交后同事务重算该终端**全部历史流水**的校正时刻，归站匹配与 UTC 归月
+  全部基于校正时刻刷新 —— 跨映射时段（换真实站点）、跨月份（换统计月）都会更新；
+- 原始 `swipe_time_utc` 永不修改；`GET /api/transactions/{txn_id}` 可同时核对
+  原始时刻、终端偏移、校正时刻与归站结果；
+- 偏移与当前值相同为幂等空操作（`changed=false`，不写审计、不动统计）；
+- 每次实际更正写入 `terminal_offset_changes` 审计（旧值/新值/影响流水数）。
+
 ## 业务规则
 
 | 规则 | 行为 |
 | --- | --- |
+| 终端时钟偏差 | 按终端设有符号秒偏移，校正时刻 = 原始 + 偏移；原始 UTC 保留 |
+| 偏移更正 | 同事务重算该终端全部历史流水，跨时段/跨月份归站与统计同步更新 |
+| 未标终端旧数据 | `terminal_id` 为空，校正时刻恒等于原始时刻，任何校时都不影响 |
+| 流水号重复 + 原始内容相同（含 terminal_id） | 跳过，不重复计数（安全重传，与偏移无关） |
+| 流水号重复 + 内容不同 | **整批拒收**，HTTP 409，已有流水不变 |
 | 临时站号复用 | 映射键是 (线路, 临时站号)，不同线路互不影响 |
 | 映射导入 | 按 (线路, 临时站号) **整组替换**；文件未涉及的组不受影响 |
 | 组内时段重叠 | **整批拒收**，HTTP 409，已有映射不变 |
-| 流水号重复 + 内容相同 | 跳过，不重复计数（安全重传） |
-| 流水号重复 + 内容不同 | **整批拒收**，HTTP 409，已有流水不变 |
-| 映射晚到 | 旧流水在新统计中自动重新归属 |
-| 统计口径 | 按刷卡时刻（UTC）落入的映射时段归属真实站点，按 UTC 月份汇总 |
-| 并发导入 | 写事务串行；查询走 WAL 快照，只见同一已提交状态 |
+| 映射晚到 | 旧流水按校正时刻在新统计中自动重新归属 |
+| 统计口径 | 按**校正时刻**落入的映射时段归属真实站点，按校正时刻的 UTC 月份汇总 |
+| 校时/导入一致性 | 校时、归站、统计同一事务提交；失败整体回滚，不留部分更改 |
+| 并发写入 | 写事务串行；查询走 WAL 快照，只见同一已提交状态 |
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/imports/swipes` | 导入刷卡流水 CSV |
+| POST | `/api/imports/swipes` | 导入刷卡流水 CSV（terminal_id 可选） |
 | POST | `/api/imports/mappings` | 导入站号映射 CSV |
-| GET | `/api/stats/monthly?month=YYYY-MM` | 真实站点 UTC 月上车量（month 可省） |
+| PUT | `/api/terminals/{terminal_id}/offset` | 按终端设置有符号秒偏移并同事务校时重算 |
+| GET | `/api/terminals/offsets` | 所有终端当前偏移 |
+| GET | `/api/terminals/{terminal_id}/offset` | 单个终端当前偏移（未设置返回 404） |
+| GET | `/api/terminals/offset-changes` | 校时审计（可按 terminal_id 过滤） |
+| GET | `/api/transactions/{txn_id}` | 单笔流水核对：原始/校正时刻、偏移、归站 |
+| GET | `/api/stats/monthly?month=YYYY-MM` | 真实站点 UTC 月上车量（按校正时刻，month 可省） |
 | GET | `/api/transactions/unattributed` | 未归属流水（含原因、分页） |
 | GET | `/api/mappings` | 当前生效映射（可按线路/站号过滤） |
 | GET | `/api/imports` | 已提交导入批次审计 |
 | GET | `/api/overview` | 数据总览 |
 | GET | `/samples/{文件名}` | 下载内置样例 CSV |
 
-## 在 /docs 里演示（含迟到改站样例）
+## 在 /docs 里演示
 
-`samples/` 目录是一组有故事线的样例（容器内也可从 `/samples/xxx.csv` 下载）：
+### A. 终端校时（跨月、跨时段重算）
 
-1. **导流水**：`POST /api/imports/swipes` 上传 `swipes_1.csv`（10 条）。
-   此时查 `GET /api/transactions/unattributed` → 全部 10 条未归属。
-2. **导映射**：`POST /api/imports/mappings` 上传 `mappings_1_initial.csv`。
-   查 `GET /api/stats/monthly` → 1–2 月各站上车量；未归属剩 3 条
-   （`S006`/`S007` 超出时段、`S008` 无映射）。注意 `T100` 被 L1、L2 复用，归属到不同真实站点。
-3. **迟到改站**：上传 `mappings_2_late_correction.csv` —— 整组替换 `(L1, T100)`，
-   把 3 月窗口延长。再查 `GET /api/stats/monthly?month=2026-03` →
-   旧流水 `S007`（3 月 2 日刷卡）被重新归属到 `Central Station North Gate`，未归属减为 2 条。
-4. **幂等重传**：上传 `swipes_2_more.csv`（含已存在的 `S001`，内容相同）→
-   `applied=2, skipped_duplicates=1`，1 月统计不重复计数。
-5. **冲突拒收**：上传 `swipes_3_conflict.csv`（`S001` 内容被改 + 新流水 `S013`）→
-   HTTP 409 整批拒收；查 `/api/overview`，`S013` 未入库，统计不变。
-6. **重叠拒收**：上传 `mappings_3_overlap.csv`（`(L1, T200)` 组内两时段重叠）→
-   HTTP 409 整批拒收；查 `/api/mappings?line=L1&temp_station_id=T200`，旧映射原样保留。
+样例 `swipes_4_clock_skew.csv` 含 6 条流水（C001–C006，部分带终端号、
+C005/C006 未标终端），配合 `mappings_1_initial.csv`：
+
+1. 先 `POST /api/imports/mappings` 上传 `mappings_1_initial.csv`，
+   再 `POST /api/imports/swipes` 上传 `swipes_4_clock_skew.csv`；
+2. `PUT /api/terminals/TM-A/offset`，body `{"offset_seconds": -1800}`：
+   C001（原始 2026-01-01T00:20）校正到 **2025-12-31T23:50**，跨出 1 月映射，
+   变成未归属；C002 从 2 月 North Gate 跨时段改挂 1 月 Central Station；
+3. `PUT /api/terminals/TM-B/offset`，body `{"offset_seconds": -3600}`：
+   C003 从 3 月跨月回到 2 月并换站；C004 回到映射左闭边界内仍归 Museum；
+4. `GET /api/transactions/C001` 同时看到原始时刻、偏移与校正时刻；
+   C005/C006 未标终端，校正时刻始终等于原始时刻；
+5. 再次上传 `swipes_5_offset_retry.csv`：C001 同号同原始内容 →
+   `skipped_duplicates=1`，偏移已变也不误报冲突。
+
+### B. 迟到改站、幂等与冲突（原有故事线）
+
+1. **导流水**：上传 `swipes_1.csv`（10 条），此时全部未归属；
+2. **导映射**：上传 `mappings_1_initial.csv`，未归属剩 3 条；
+3. **迟到改站**：上传 `mappings_2_late_correction.csv`，S007 被重新归属；
+4. **幂等重传**：上传 `swipes_2_more.csv` → `applied=2, skipped_duplicates=1`；
+5. **冲突拒收**：上传 `swipes_3_conflict.csv` → HTTP 409 整批拒收；
+6. **重叠拒收**：上传 `mappings_3_overlap.csv` → HTTP 409 整批拒收。
 
 命令行等价演示：`docker compose up -d` 后执行 `bash scripts/demo.sh`。
 
 ## 一致性设计
 
-- **单写事务**：所有导入经全局写锁串行化，`BEGIN IMMEDIATE` 开启事务；
-  映射/流水写入与月度统计全量重算在**同一事务**内完成并提交；
+- **单写事务**：所有导入与校时经全局写锁串行化，`BEGIN IMMEDIATE` 开启事务；
+  终端偏移更新、历史流水校正时刻重算、月度统计全量重算在**同一事务**内完成并提交；
 - **快照读**：SQLite WAL 模式，查询连接读到的是某一已提交快照，
-  不会看到导入进行中的中间态；两个并发导入也只会以某种先后顺序整体生效；
-- **失败即回滚**：校验失败（422）在写事务之前返回；业务冲突（409）在事务内抛出，
-  触发回滚 —— 包括批次审计表在内，失败的导入不留任何痕迹；
-- **幂等键**：流水以 `txn_id` 为主键，内容逐字段比对，同内容跳过、异内容拒收。
+  不会看到校时/导入进行中的中间态；
+- **失败即回滚**：校验失败（422）在写事务之前返回；业务冲突（409）或事务内
+  任何异常都触发回滚 —— 偏移、流水校正时刻、统计、审计要么全部生效，要么全部不变；
+- **幂等键**：流水以 `txn_id` 为主键，按原始字段（含 terminal_id）逐字段比对，
+  同内容跳过、异内容拒收；判重与校正时刻解耦；
+- **旧库升级**：启动时自动幂等迁移（补 `terminal_id`/`corrected_time_utc`
+  列并以原始时刻回填、新建终端偏移与审计表），旧数据行为不变。
 
 ## 本地开发与测试
 
@@ -108,12 +155,12 @@ python -m pytest tests/ -v
 
 ```
 app/
-  main.py     # FastAPI 入口与接口定义
-  service.py  # 导入/重算/查询核心业务逻辑
-  csvio.py    # CSV 解析与 UTC 时间规范化
-  db.py       # SQLite 连接、schema、写事务（WAL + 串行化）
-samples/      # 成组样例 CSV（/samples 可下载）
+  main.py     # FastAPI 入口与接口定义（导入 / 终端校时 / 查询）
+  service.py  # 导入/校时/重算/查询核心业务逻辑
+  csvio.py    # CSV 解析（terminal_id 可选列）与 UTC 时间规范化
+  db.py       # SQLite 连接、schema、旧库迁移、写事务（WAL + 串行化）
+samples/      # 成组样例 CSV（/samples 可下载），含校时场景
 scripts/demo.sh
-tests/test_app.py
+tests/        # 原故事线 + 校时专题 + 迁移/回滚持久化测试
 Dockerfile / docker-compose.yml
 ```

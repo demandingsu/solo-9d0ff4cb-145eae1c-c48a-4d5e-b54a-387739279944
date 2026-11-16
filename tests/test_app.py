@@ -244,8 +244,8 @@ def test_concurrent_imports_and_consistent_reads(tmp_path, monkeypatch):
                        (SELECT COUNT(*) FROM swipes s WHERE NOT EXISTS (
                             SELECT 1 FROM mappings m
                             WHERE m.line = s.line AND m.temp_station_id = s.temp_station_id
-                              AND s.swipe_time_utc >= m.valid_from_utc
-                              AND s.swipe_time_utc <  m.valid_to_utc)) AS unattributed
+                              AND s.corrected_time_utc >= m.valid_from_utc
+                              AND s.corrected_time_utc <  m.valid_to_utc)) AS unattributed
             """
             for _ in range(30):
                 conn = db.connect()

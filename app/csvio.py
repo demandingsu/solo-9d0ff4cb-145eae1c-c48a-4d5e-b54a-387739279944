@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 SWIPE_COLUMNS = ["txn_id", "swipe_time_utc", "line", "temp_station_id"]
+# 可选列：表头里没有 terminal_id 也合法（视为未标终端的旧格式流水）
+SWIPE_OPTIONAL_COLUMNS = ["terminal_id"]
 MAPPING_COLUMNS = [
     "line",
     "temp_station_id",
@@ -35,6 +37,7 @@ class SwipeRow:
     swipe_time_utc: str
     line: str
     temp_station_id: str
+    terminal_id: str | None = None  # None/空串表示未标终端，不参与校时
 
 
 @dataclass(frozen=True)
@@ -64,7 +67,15 @@ def fmt_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
-def _read_grid(raw: bytes, required: list[str]) -> list[tuple[int, dict[str, str]]]:
+def _read_grid(
+    raw: bytes, required: list[str], optional: list[str] | None = None
+) -> list[tuple[int, dict[str, str | None]]]:
+    """解析 CSV 为 (行号, 记录字典)。
+
+    required 列必须出现在表头；optional 列缺失时对应键值为 None，
+    存在但单元格为空时为空串（由调用方决定如何归一）。
+    """
+    optional = optional or []
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -78,14 +89,22 @@ def _read_grid(raw: bytes, required: list[str]) -> list[tuple[int, dict[str, str
         raise CsvError(
             [f"缺少必需列: {', '.join(missing)}；必需列为: {', '.join(required)}"]
         )
-    idx = {name: header.index(name) for name in required}
-    grid: list[tuple[int, dict[str, str]]] = []
+    idx = {name: header.index(name) for name in required if name in header}
+    opt_present = {name: header.index(name) for name in optional if name in header}
+    grid: list[tuple[int, dict[str, str | None]]] = []
     errors: list[str] = []
     for lineno, r in enumerate(rows[1:], start=2):
         if len(r) < len(header):
             errors.append(f"第 {lineno} 行: 列数不足（{len(r)} < {len(header)}）")
             continue
-        grid.append((lineno, {name: r[i].strip() for name, i in idx.items()}))
+        rec: dict[str, str | None] = {
+            name: r[i].strip() for name, i in idx.items()
+        }
+        for name, i in opt_present.items():
+            rec[name] = r[i].strip()
+        for name in optional:
+            rec.setdefault(name, None)
+        grid.append((lineno, rec))
     if errors:
         raise CsvError(errors)
     if not grid:
@@ -94,7 +113,7 @@ def _read_grid(raw: bytes, required: list[str]) -> list[tuple[int, dict[str, str
 
 
 def parse_swipes(raw: bytes) -> list[SwipeRow]:
-    grid = _read_grid(raw, SWIPE_COLUMNS)
+    grid = _read_grid(raw, SWIPE_COLUMNS, SWIPE_OPTIONAL_COLUMNS)
     parsed: list[SwipeRow] = []
     errors: list[str] = []
     for lineno, rec in grid:
@@ -110,12 +129,14 @@ def parse_swipes(raw: bytes) -> list[SwipeRow]:
                 f"第 {lineno} 行: swipe_time_utc 无法解析: {rec['swipe_time_utc']!r}"
             )
             continue
+        terminal_id = rec.get("terminal_id") or None  # 空串/缺列都归一为 None
         parsed.append(
             SwipeRow(
                 txn_id=rec["txn_id"],
                 swipe_time_utc=t,
                 line=rec["line"],
                 temp_station_id=rec["temp_station_id"],
+                terminal_id=terminal_id,
             )
         )
     if errors:
